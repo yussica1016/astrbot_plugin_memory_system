@@ -1,0 +1,8 @@
+name: astrbot_plugin_memory_system
+display_name: 综合记忆管理系统（初级版）
+desc: "基于遗忘曲线和情绪效价的记忆管理插件。能存、能忘、能自己浮上来。"
+version: "1.0.0"
+author: "沈砚清"
+repo: "https://github.com/yussica1016/astrbot_plugin_memory_system"
+type: common
+astrbot_version: ">=4.18.2"
