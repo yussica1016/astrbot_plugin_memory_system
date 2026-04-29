@@ -6,6 +6,7 @@
 import math
 import os
 import sqlite3
+import time
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional
 
@@ -46,13 +47,16 @@ class MemorySystemStar(Star):
     """基于遗忘曲线和情绪效价的记忆管理。能存、能忘、能自己浮上来。"""
 
     DECAY_LAMBDA = 0.05
+    _SCORE_UPDATE_COOLDOWN = 60  # 秒，两次全量更新之间的最小间隔
 
     def __init__(self, context: Context, config=None) -> None:
         super().__init__(context)
         self.config = config or {}
-        self.data_dir = str(StarTools.get_data_dir(self.name))
+        plugin_name = getattr(self, "name", None) or "astrbot_plugin_memory_system"
+        self.data_dir = str(StarTools.get_data_dir(plugin_name))
         os.makedirs(self.data_dir, exist_ok=True)
         self.db_path = os.path.join(self.data_dir, "memory.db")
+        self._last_score_update = 0.0
         self._init_db()
 
     # ───────── 数据库 ─────────
@@ -60,6 +64,7 @@ class MemorySystemStar(Star):
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
         return conn
 
     def _init_db(self) -> None:
@@ -110,6 +115,12 @@ class MemorySystemStar(Star):
     # ───────── 衰减 ─────────
 
     def _update_scores(self, conn: sqlite3.Connection) -> None:
+        """衰减分数更新，加冷却防止频繁全量刷库"""
+        now_ts = time.time()
+        if now_ts - self._last_score_update < self._SCORE_UPDATE_COOLDOWN:
+            return
+        self._last_score_update = now_ts
+
         cursor = conn.execute(
             "SELECT id, created_at, last_recalled_at, importance, layer "
             "FROM memories WHERE status = 'active';"
@@ -125,26 +136,33 @@ class MemorySystemStar(Star):
             base = max(1, min(10, int(r["importance"]))) / 10.0
             score = float(base * math.exp(-self.DECAY_LAMBDA * hours))
             updates.append((score, r["id"]))
-        if updates:
+        # 批量更新，每500条一批防止SQL变量过多
+        for i in range(0, len(updates), 500):
+            batch = updates[i:i + 500]
             conn.executemany(
-                "UPDATE memories SET forgetting_score = ? WHERE id = ?;", updates
+                "UPDATE memories SET forgetting_score = ? WHERE id = ?;", batch
             )
+        if updates:
             conn.commit()
 
     def _mark_recalled(self, conn: sqlite3.Connection, ids: List[int]) -> None:
         if not ids:
             return
         now_iso = self._now_iso()
-        ph = ",".join("?" for _ in ids)
-        conn.execute(
-            f"UPDATE memories SET last_recalled_at = ?, forgetting_score = importance / 10.0 "
-            f"WHERE id IN ({ph}) AND layer != 'core';",
-            [now_iso, *ids],
-        )
-        conn.execute(
-            f"UPDATE memories SET last_recalled_at = ? WHERE id IN ({ph}) AND layer = 'core';",
-            [now_iso, *ids],
-        )
+        # 分批处理防止超出SQLite变量上限(默认999)
+        chunk_size = 400
+        for i in range(0, len(ids), chunk_size):
+            batch = ids[i:i + chunk_size]
+            ph = ",".join("?" for _ in batch)
+            conn.execute(
+                f"UPDATE memories SET last_recalled_at = ?, forgetting_score = importance / 10.0 "
+                f"WHERE id IN ({ph}) AND layer != 'core';",
+                [now_iso, *batch],
+            )
+            conn.execute(
+                f"UPDATE memories SET last_recalled_at = ? WHERE id IN ({ph}) AND layer = 'core';",
+                [now_iso, *batch],
+            )
         conn.commit()
 
     # ───────── 保存（含自动合并） ─────────
@@ -186,7 +204,7 @@ class MemorySystemStar(Star):
                     merged_content = old.strip()
                     if content.strip() not in merged_content:
                         merged_content += "\n——\n" + content.strip()
-                    merged_tags = _normalize_tags(",".join(filter(None, [row["tags"] or "", tags])))
+                    merged_tags = _normalize_tags(",".join(t for t in [row["tags"] or "", tags] if t))
                     merged_imp = max(int(row["importance"]), importance)
                     merged_val = (float(row["valence"]) + valence) / 2.0
                     merged_aro = (float(row["arousal"]) + arousal) / 2.0
@@ -224,8 +242,10 @@ class MemorySystemStar(Star):
                 clauses.append("category = ?")
                 params.append(category)
             if keyword:
-                clauses.append("(content LIKE ? OR tags LIKE ?)")
-                kw = f"%{keyword}%"
+                # 转义LIKE通配符防止注入
+                escaped_kw = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                clauses.append("(content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')")
+                kw = f"%{escaped_kw}%"
                 params.extend([kw, kw])
             where = " AND ".join(clauses)
             cursor = conn.execute(
