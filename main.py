@@ -6,6 +6,7 @@
 import math
 import os
 import sqlite3
+import threading
 import time
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional
@@ -56,6 +57,7 @@ class MemorySystemStar(Star):
         self.data_dir = str(StarTools.get_data_dir(plugin_name))
         os.makedirs(self.data_dir, exist_ok=True)
         self.db_path = os.path.join(self.data_dir, "memory.db")
+        self._db_lock = threading.Lock()  # 防并发写入冲突
         self._last_score_update = 0.0
         self._init_db()
 
@@ -182,52 +184,53 @@ class MemorySystemStar(Star):
         valence = float(max(-1.0, min(1.0, valence)))
         arousal = float(max(0.0, min(1.0, arousal)))
 
-        conn = self._conn()
-        try:
-            self._update_scores(conn)
-            now_iso = self._now_iso()
+        with self._db_lock:
+            conn = self._conn()
+            try:
+                self._update_scores(conn)
+                now_iso = self._now_iso()
 
-            # 24小时内同分类查重
-            since = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
-            cursor = conn.execute(
-                "SELECT id, content, tags, importance, valence, arousal "
-                "FROM memories WHERE category = ? AND status = 'active' AND created_at >= ? "
-                "ORDER BY created_at DESC LIMIT 50;",
-                (category, since),
-            )
-            merge_id = None
-            for row in cursor.fetchall():
-                old = row["content"]
-                sim = _similarity_bigram_jaccard(old, content)
-                if sim >= 0.7 or content in old or old in content:
-                    merge_id = int(row["id"])
-                    merged_content = old.strip()
-                    if content.strip() not in merged_content:
-                        merged_content += "\n——\n" + content.strip()
-                    merged_tags = _normalize_tags(",".join(t for t in [row["tags"] or "", tags] if t))
-                    merged_imp = max(int(row["importance"]), importance)
-                    merged_val = (float(row["valence"]) + valence) / 2.0
-                    merged_aro = (float(row["arousal"]) + arousal) / 2.0
-                    conn.execute(
-                        "UPDATE memories SET content=?, tags=?, importance=?, valence=?, arousal=?, "
-                        "forgetting_score=?, last_recalled_at=NULL WHERE id=?;",
-                        (merged_content, merged_tags, merged_imp, merged_val, merged_aro,
-                         merged_imp / 10.0, merge_id),
-                    )
-                    conn.commit()
-                    return {"id": merge_id, "merged": True}
+                # 24小时内同分类查重
+                since = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
+                cursor = conn.execute(
+                    "SELECT id, content, tags, importance, valence, arousal "
+                    "FROM memories WHERE category = ? AND status = 'active' AND created_at >= ? "
+                    "ORDER BY created_at DESC LIMIT 50;",
+                    (category, since),
+                )
+                merge_id = None
+                for row in cursor.fetchall():
+                    old = row["content"]
+                    sim = _similarity_bigram_jaccard(old, content)
+                    if sim >= 0.7 or content in old or old in content:
+                        merge_id = int(row["id"])
+                        merged_content = old.strip()
+                        if content.strip() not in merged_content:
+                            merged_content += "\n——\n" + content.strip()
+                        merged_tags = _normalize_tags(",".join(t for t in [row["tags"] or "", tags] if t))
+                        merged_imp = max(int(row["importance"]), importance)
+                        merged_val = (float(row["valence"]) + valence) / 2.0
+                        merged_aro = (float(row["arousal"]) + arousal) / 2.0
+                        conn.execute(
+                            "UPDATE memories SET content=?, tags=?, importance=?, valence=?, arousal=?, "
+                            "forgetting_score=?, last_recalled_at=NULL WHERE id=?;",
+                            (merged_content, merged_tags, merged_imp, merged_val, merged_aro,
+                             merged_imp / 10.0, merge_id),
+                        )
+                        conn.commit()
+                        return {"id": merge_id, "merged": True}
 
-            # 新记忆
-            cursor = conn.execute(
-                "INSERT INTO memories (created_at, category, content, tags, valence, arousal, "
-                "importance, forgetting_score, status, layer, resolved) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 'event', 0);",
-                (now_iso, category, content, tags, valence, arousal, importance, importance / 10.0),
-            )
-            conn.commit()
-            return {"id": int(cursor.lastrowid), "merged": False}
-        finally:
-            conn.close()
+                # 新记忆
+                cursor = conn.execute(
+                    "INSERT INTO memories (created_at, category, content, tags, valence, arousal, "
+                    "importance, forgetting_score, status, layer, resolved) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 'event', 0);",
+                    (now_iso, category, content, tags, valence, arousal, importance, importance / 10.0),
+                )
+                conn.commit()
+                return {"id": int(cursor.lastrowid), "merged": False}
+            finally:
+                conn.close()
 
     # ───────── 查询 ─────────
 
@@ -576,22 +579,23 @@ class MemorySystemStar(Star):
         """
         if not memory_id:
             return "请提供记忆ID。"
-        conn = self._conn()
-        try:
-            row = conn.execute("SELECT id, layer, content FROM memories WHERE id = ?;", (memory_id,)).fetchone()
-            if not row:
-                return f"记忆 #{memory_id} 不存在。"
-            if row["layer"] == "core":
-                return f"记忆 #{memory_id} 已是 core 层。"
-            conn.execute(
-                "UPDATE memories SET layer = 'core', forgetting_score = 9999.0 WHERE id = ?;",
-                (memory_id,),
-            )
-            conn.commit()
-            preview = row["content"][:60] + ("..." if len(row["content"]) > 60 else "")
-            return f"记忆 #{memory_id} 已标记为 core（永久不衰减）。\n{preview}"
-        finally:
-            conn.close()
+        with self._db_lock:
+            conn = self._conn()
+            try:
+                row = conn.execute("SELECT id, layer, content FROM memories WHERE id = ?;", (memory_id,)).fetchone()
+                if not row:
+                    return f"记忆 #{memory_id} 不存在。"
+                if row["layer"] == "core":
+                    return f"记忆 #{memory_id} 已是 core 层。"
+                conn.execute(
+                    "UPDATE memories SET layer = 'core', forgetting_score = 9999.0 WHERE id = ?;",
+                    (memory_id,),
+                )
+                conn.commit()
+                preview = row["content"][:60] + ("..." if len(row["content"]) > 60 else "")
+                return f"记忆 #{memory_id} 已标记为 core（永久不衰减）。\n{preview}"
+            finally:
+                conn.close()
 
     @filter.llm_tool()
     async def memory_resolve(
@@ -604,19 +608,20 @@ class MemorySystemStar(Star):
         """
         if not memory_id:
             return "请提供记忆ID。"
-        conn = self._conn()
-        try:
-            row = conn.execute("SELECT id, resolved, content FROM memories WHERE id = ?;", (memory_id,)).fetchone()
-            if not row:
-                return f"记忆 #{memory_id} 不存在。"
-            if int(row["resolved"] or 0):
-                return f"记忆 #{memory_id} 已是已解决状态。"
-            conn.execute("UPDATE memories SET resolved = 1 WHERE id = ?;", (memory_id,))
-            conn.commit()
-            preview = row["content"][:60] + ("..." if len(row["content"]) > 60 else "")
-            return f"记忆 #{memory_id} 已标记为已解决。\n{preview}"
-        finally:
-            conn.close()
+        with self._db_lock:
+            conn = self._conn()
+            try:
+                row = conn.execute("SELECT id, resolved, content FROM memories WHERE id = ?;", (memory_id,)).fetchone()
+                if not row:
+                    return f"记忆 #{memory_id} 不存在。"
+                if int(row["resolved"] or 0):
+                    return f"记忆 #{memory_id} 已是已解决状态。"
+                conn.execute("UPDATE memories SET resolved = 1 WHERE id = ?;", (memory_id,))
+                conn.commit()
+                preview = row["content"][:60] + ("..." if len(row["content"]) > 60 else "")
+                return f"记忆 #{memory_id} 已标记为已解决。\n{preview}"
+            finally:
+                conn.close()
 
     @filter.llm_tool()
     async def memory_decay_status(self, event: AstrMessageEvent) -> str:
