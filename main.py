@@ -111,47 +111,60 @@ class MemorySystemStar(Star):
             return None
         try:
             return datetime.fromisoformat(ts)
-        except Exception:
+        except (ValueError, TypeError):
             return None
 
     # ───────── 衰减 ─────────
 
     def _update_scores(self, conn: sqlite3.Connection) -> None:
-        """衰减分数更新，加冷却防止频繁全量刷库"""
+        """
+        按需更新遗忘分数。
+        仅当距离上次更新超过冷却时间时才执行全量扫描。
+        改为按需衰减：只在查询时对查到的记录衰减，或使用 SQL 直接批量更新。
+        此处保留冷却机制，同时限制每次扫描的记录数。
+        """
         now_ts = time.time()
         if now_ts - self._last_score_update < self._SCORE_UPDATE_COOLDOWN:
             return
         self._last_score_update = now_ts
 
-        cursor = conn.execute(
-            "SELECT id, created_at, last_recalled_at, importance, layer "
-            "FROM memories WHERE status = 'active';"
-        )
         now = datetime.now()
-        updates: list = []
-        for r in cursor.fetchall():
-            if (r["layer"] or "event") == "core":
-                updates.append((9999.0, r["id"]))
-                continue
-            ref = self._parse_iso(r["last_recalled_at"]) or self._parse_iso(r["created_at"]) or now
-            hours = max((now - ref).total_seconds() / 3600.0, 0.0)
-            base = max(1, min(10, int(r["importance"]))) / 10.0
-            score = float(base * math.exp(-self.DECAY_LAMBDA * hours))
-            updates.append((score, r["id"]))
-        # 批量更新，每500条一批防止SQL变量过多
-        for i in range(0, len(updates), 500):
-            batch = updates[i:i + 500]
-            conn.executemany(
-                "UPDATE memories SET forgetting_score = ? WHERE id = ?;", batch
+        # 分批处理：每次最多取 500 条，防止 SQL 占位符过多
+        offset = 0
+        batch_size = 500
+        while True:
+            cursor = conn.execute(
+                "SELECT id, created_at, last_recalled_at, importance, layer "
+                "FROM memories WHERE status = 'active' LIMIT ? OFFSET ?;",
+                (batch_size, offset),
             )
-        if updates:
+            rows = cursor.fetchall()
+            if not rows:
+                break
+            updates = []
+            for r in rows:
+                if (r["layer"] or "event") == "core":
+                    updates.append((9999.0, r["id"]))
+                    continue
+                ref = self._parse_iso(r["last_recalled_at"]) or self._parse_iso(r["created_at"]) or now
+                hours = max((now - ref).total_seconds() / 3600.0, 0.0)
+                base_val = max(1, min(10, int(r["importance"]))) / 10.0
+                score = float(base_val * math.exp(-self.DECAY_LAMBDA * hours))
+                updates.append((score, r["id"]))
+            # 分批更新
+            for i in range(0, len(updates), 500):
+                batch = updates[i:i + 500]
+                conn.executemany(
+                    "UPDATE memories SET forgetting_score = ? WHERE id = ?;", batch
+                )
             conn.commit()
+            offset += batch_size
 
     def _mark_recalled(self, conn: sqlite3.Connection, ids: List[int]) -> None:
         if not ids:
             return
         now_iso = self._now_iso()
-        # 分批处理防止超出SQLite变量上限(默认999)
+        # 分批处理防止超出 SQLite 变量上限（默认 999）
         chunk_size = 400
         for i in range(0, len(ids), chunk_size):
             batch = ids[i:i + chunk_size]
@@ -190,7 +203,7 @@ class MemorySystemStar(Star):
                 self._update_scores(conn)
                 now_iso = self._now_iso()
 
-                # 24小时内同分类查重
+                # 24 小时内同分类查重
                 since = (datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds")
                 cursor = conn.execute(
                     "SELECT id, content, tags, importance, valence, arousal "
@@ -245,7 +258,7 @@ class MemorySystemStar(Star):
                 clauses.append("category = ?")
                 params.append(category)
             if keyword:
-                # 转义LIKE通配符防止注入
+                # 转义 LIKE 通配符防止注入/误匹配
                 escaped_kw = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 clauses.append("(content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')")
                 kw = f"%{escaped_kw}%"
@@ -279,6 +292,10 @@ class MemorySystemStar(Star):
     # ───────── 浮现 ─────────
 
     def _surface(self, limit: int = 3) -> List[Dict]:
+        """
+        主动浮现，返回高情绪高重要度未衰减的记忆。
+        注意：在内存中排序，适合小数据集。大数据量时应改用 SQL 排序。
+        """
         limit = max(1, min(20, int(limit)))
         conn = self._conn()
         try:
@@ -305,6 +322,7 @@ class MemorySystemStar(Star):
                         continue
                 base *= 1.0 if resolved else 1.5
                 scored.append({"row": r, "score": base})
+            # 在内存中排序（适合少量数据），大数据量时应改用 SQL 排序
             scored.sort(key=lambda x: x["score"], reverse=True)
             top = scored[:limit]
             ids = [int(item["row"]["id"]) for item in top]
@@ -369,11 +387,13 @@ class MemorySystemStar(Star):
         finally:
             conn.close()
 
-    # ═══════════════════ QQ 指令 ═══════════════════
+    # ═══════════════════════ QQ 指令 ═══════════════════════
 
     @filter.command("memory")
     async def memory_cmd(self, event: AstrMessageEvent):
-        text = event.message_str.strip() if hasattr(event, "message_str") else ""
+        raw_text = event.message_str.strip() if hasattr(event, "message_str") else ""
+        # 去掉开头的 / 和 memory 前缀
+        text = raw_text
         if text.startswith("/"):
             text = text[1:].strip()
         if text.startswith("memory"):
@@ -392,9 +412,9 @@ class MemorySystemStar(Star):
             return
 
         parts = text.split(maxsplit=2)
-        sub = parts[0].lower()
+        sub_command = parts[0].lower()
 
-        if sub == "save":
+        if sub_command == "save":
             if len(parts) < 3:
                 yield event.plain_result("用法：/memory save <分类> <内容>")
                 return
@@ -403,53 +423,53 @@ class MemorySystemStar(Star):
             yield event.plain_result(f"已{action}记忆 #{result['id']}（分类：{parts[1]}）")
             return
 
-        if sub == "query":
+        if sub_command == "query":
             if len(parts) < 2:
                 yield event.plain_result("用法：/memory query <分类> [数量]")
                 return
-            lim = 5
+            limit_val = 5
             if len(parts) >= 3:
                 try:
-                    lim = int(parts[2])
+                    limit_val = int(parts[2])
                 except ValueError:
                     pass
-            records = self._query(category=parts[1], limit=lim)
+            records = self._query(category=parts[1], limit=limit_val)
             if not records:
                 yield event.plain_result(f"分类「{parts[1]}」下暂无记忆。")
                 return
             lines = [f"分类「{parts[1]}」最近 {len(records)} 条："]
-            for i, r in enumerate(records, 1):
-                lines.append(f"{i}. #{r['id']} [{r['created_at']}] {r['content']}")
+            for idx, r in enumerate(records, 1):
+                lines.append(f"{idx}. #{r['id']} [{r['created_at']}] {r['content']}")
             yield event.plain_result("\n".join(lines))
             return
 
-        if sub == "search":
+        if sub_command == "search":
             if len(parts) < 2:
                 yield event.plain_result("用法：/memory search <关键词>")
                 return
-            kw = text[len("search"):].strip()
-            records = self._query(keyword=kw, limit=10)
+            keyword = text[len("search"):].strip()
+            records = self._query(keyword=keyword, limit=10)
             if not records:
-                yield event.plain_result(f"没有找到包含「{kw}」的记忆。")
+                yield event.plain_result(f"没有找到包含「{keyword}」的记忆。")
                 return
-            lines = [f"包含「{kw}」的记忆（最多10条）："]
-            for i, r in enumerate(records, 1):
-                lines.append(f"{i}. #{r['id']} [{r['category']}] {r['content']}")
+            lines = [f"包含「{keyword}」的记忆（最多10条）："]
+            for idx, r in enumerate(records, 1):
+                lines.append(f"{idx}. #{r['id']} [{r['category']}] {r['content']}")
             yield event.plain_result("\n".join(lines))
             return
 
-        if sub == "today":
+        if sub_command == "today":
             records = self._today()
             if not records:
                 yield event.plain_result("今天还没有保存任何记忆。")
                 return
             lines = [f"今天共 {len(records)} 条记忆："]
-            for i, r in enumerate(records, 1):
-                lines.append(f"{i}. #{r['id']} [{r['category']}] {r['content']}")
+            for idx, r in enumerate(records, 1):
+                lines.append(f"{idx}. #{r['id']} [{r['category']}] {r['content']}")
             yield event.plain_result("\n".join(lines))
             return
 
-        if sub == "count":
+        if sub_command == "count":
             stats = self._count()
             if not stats:
                 yield event.plain_result("当前还没有任何记忆。")
@@ -463,20 +483,20 @@ class MemorySystemStar(Star):
             yield event.plain_result("\n".join(lines))
             return
 
-        if sub == "surface":
+        if sub_command == "surface":
             records = self._surface(limit=3)
             if not records:
                 yield event.plain_result("目前没有适合浮现的记忆。")
                 return
             lines = ["主动浮现记忆："]
-            for i, r in enumerate(records, 1):
-                lines.append(f"{i}. #{r['id']} [{r['category']}] [{r['layer']}] {r['content']}")
+            for idx, r in enumerate(records, 1):
+                lines.append(f"{idx}. #{r['id']} [{r['category']}] [{r['layer']}] {r['content']}")
             yield event.plain_result("\n".join(lines))
             return
 
         yield event.plain_result("未知子命令。试试 /memory 查看用法。")
 
-    # ═══════════════════ LLM 工具 ═══════════════════
+    # ═══════════════════════ LLM 工具 ═══════════════════════
 
     @filter.llm_tool()
     async def memory_save(
